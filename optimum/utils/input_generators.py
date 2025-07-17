@@ -1308,6 +1308,126 @@ class GemmaDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
         ]
 
 
+class DummyGemma3InputGenerator(DummyTextInputGenerator):
+    SUPPORTED_INPUT_NAMES = {
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "position_ids",
+        "full_causal_mask",
+        "sliding_causal_mask",
+    }
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedTextConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        num_choices: int = DEFAULT_DUMMY_SHAPES["num_choices"],
+        random_batch_size_range: Optional[Tuple[int, int]] = None,
+        random_sequence_length_range: Optional[Tuple[int, int]] = None,
+        random_num_choices_range: Optional[Tuple[int, int]] = None,
+        padding_side: str = "right",
+        **kwargs,
+    ):
+        super().__init__(
+            task=task,
+            normalized_config=normalized_config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            num_choices=num_choices,
+            random_batch_size_range=random_batch_size_range,
+            random_sequence_length_range=random_sequence_length_range,
+            random_num_choices_range=random_num_choices_range,
+            padding_side=padding_side,
+            **kwargs,
+        )
+        self.sliding_window_size = getattr(normalized_config, "sliding_window", sequence_length)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name in ["input_ids", "token_type_ids", "position_ids"]:
+            return super().generate(
+                input_name=input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype
+            )
+        if input_name == "attention_mask":
+            return {
+                "full_causal_mask": self._generate_full_causal_mask(framework, float_dtype),
+                "sliding_causal_mask": self._generate_sliding_causal_mask(framework, float_dtype),
+            }
+        # if input_name == "full_causal_mask":
+        #     return self._generate_full_causal_mask(framework, float_dtype)
+        # elif input_name == "sliding_causal_mask":
+        #     return self._generate_sliding_causal_mask(framework, float_dtype)
+        else:
+            raise ValueError(f"What happened? This is not supported and should not be here: {input_name}")
+
+    def _generate_full_causal_mask(self, framework: str = "pt", float_dtype: str = "float32"):
+        if framework == "pt":
+            mask = torch.triu(
+                torch.ones((self.sequence_length, self.sequence_length), dtype=DTYPE_MAPPER.pt(float_dtype)),
+                diagonal=1,
+            )
+            mask = mask.masked_fill(mask == 1, float("-inf"))
+            mask = mask.unsqueeze(0).expand(self.batch_size, -1, -1)
+            return mask
+        elif framework == "tf":
+            mask = tf.linalg.band_part(
+                tf.ones((self.sequence_length, self.sequence_length), dtype=DTYPE_MAPPER.tf(float_dtype)), -1, 0
+            )
+            mask = tf.where(mask == 0, float("-inf"), 0.0)
+            mask = tf.expand_dims(mask, 0)
+            mask = tf.tile(mask, [self.batch_size, 1, 1])
+            return mask
+        else:
+            mask = np.triu(
+                np.ones((self.sequence_length, self.sequence_length), dtype=DTYPE_MAPPER.np(float_dtype)), k=1
+            )
+            mask = np.where(mask == 1, float("-inf"), 0.0)
+            mask = np.expand_dims(mask, 0)
+            mask = np.tile(mask, (self.batch_size, 1, 1))
+            return mask
+
+    def _generate_sliding_causal_mask(self, framework: str = "pt", float_dtype: str = "fp32"):
+        if framework == "pt":
+            mask = torch.full(
+                (self.sequence_length, self.sequence_length), float("-inf"), dtype=DTYPE_MAPPER.pt(float_dtype)
+            )
+            for i in range(self.sequence_length):
+                start = max(0, i - self.sliding_window_size + 1)
+                mask[i, start : i + 1] = 0.0
+            mask = mask.unsqueeze(0).expand(self.batch_size, -1, -1)
+            return mask
+        elif framework == "tf":
+            mask = tf.fill((self.sequence_length, self.sequence_length), float("-inf"))
+            mask = tf.cast(mask, DTYPE_MAPPER.tf(float_dtype))
+
+            updates = []
+            indices = []
+            for i in range(self.sequence_length):
+                start = max(0, i - self.sliding_window_size + 1)
+                for j in range(start, i + 1):
+                    indices.append([i, j])
+                    updates.append(0.0)
+            if indices:
+                indices = tf.constant(indices)
+                updates = tf.constant(updates, dtype=DTYPE_MAPPER.tf(float_dtype))
+                mask = tf.tensor_scatter_nd_update(mask, indices, updates)
+            mask = tf.expand_dims(mask, 0)
+            mask = tf.tile(mask, [self.batch_size, 1, 1])
+            return mask
+        else:
+            mask = np.full(
+                (self.sequence_length, self.sequence_length), float("-inf"), dtype=DTYPE_MAPPER.np(float_dtype)
+            )
+            for i in range(self.sequence_length):
+                start = max(0, i - self.sliding_window_size + 1)
+                mask[i, start : i + 1] = 0.0
+            mask = np.expand_dims(mask, 0)
+            mask = np.tile(mask, (self.batch_size, 1, 1))
+            return mask
+
+
 class DummySpeechT5InputGenerator(DummyInputGenerator):
     SUPPORTED_INPUT_NAMES = ("output_sequence", "speaker_embeddings", "spectrogram")
 

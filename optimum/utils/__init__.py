@@ -72,6 +72,7 @@ from .input_generators import (
     DummyEncodecInputGenerator,
     DummyFluxTransformerTextInputGenerator,
     DummyFluxTransformerVisionInputGenerator,
+    DummyGemma3InputGenerator,
     DummyInputGenerator,
     DummyIntGenerator,
     DummyLabelsGenerator,

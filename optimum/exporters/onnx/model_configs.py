@@ -34,6 +34,7 @@ from ...utils import (
     DummyEncodecInputGenerator,
     DummyFluxTransformerTextInputGenerator,
     DummyFluxTransformerVisionInputGenerator,
+    DummyGemma3InputGenerator,
     DummyInputGenerator,
     DummyIntGenerator,
     DummyPastKeyValuesGenerator,
@@ -466,6 +467,23 @@ class GemmaOnnxConfig(LlamaOnnxConfig):
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, GemmaDummyPastKeyValuesGenerator)
     DUMMY_PKV_GENERATOR_CLASS = GemmaDummyPastKeyValuesGenerator
     MIN_TRANSFORMERS_VERSION = version.parse("4.38.0")
+
+
+@register_tasks_manager_onnx("gemma3_text", *COMMON_TEXT_GENERATION_TASKS + ["text-classification"])
+class Gemma3OnnxConfiguration(GemmaOnnxConfig):
+    DEFAULT_ONNX_OPSET = 20
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyGemma3InputGenerator, GemmaDummyPastKeyValuesGenerator)
+
+    # @property
+    # def inputs(self) -> Dict[str, Dict[int, str]]:
+    #     common_inputs = super().inputs
+    #     common_inputs.update(
+    #         {
+    #             "full_causal_mask": {0: "batch_size", 1: "sequence_length", 2: "sequence_length"},
+    #             "sliding_causal_mask": {0: "batch_size", 1: "sequence_length", 2: "sequence_length"},
+    #         }
+    #     )
+    #     return common_inputs
 
 
 @register_tasks_manager_onnx("granite", *COMMON_TEXT_GENERATION_TASKS)
