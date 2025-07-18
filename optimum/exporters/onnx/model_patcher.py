@@ -24,7 +24,7 @@ import torch
 import transformers
 from transformers.models.speecht5.modeling_speecht5 import SpeechT5EncoderWithSpeechPrenet
 
-from ...utils import is_transformers_version, logging
+from ...utils import is_torch_version, is_transformers_version, logging
 from ._traceable_cache import TraceableCache
 
 
@@ -40,6 +40,8 @@ if is_transformers_version(">=", "4.48"):
     from transformers.cache_utils import DynamicCache, EncoderDecoderCache
     from transformers.integrations.sdpa_attention import repeat_kv, sdpa_attention_forward
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+if is_transformers_version(">=", "4.53"):
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, _ignore_causal_mask_sdpa, prepare_padding_mask
 
 
 if TYPE_CHECKING:
@@ -218,6 +220,72 @@ def onnx_compatible_linalg_norm(x, ord=2, dim=None, keepdim=False, *, dtype=None
     return original_linal_norm(x, ord=ord, dim=dim, keepdim=keepdim, dtype=dtype, out=out)
 
 
+def sdpa_mask_without_vmap(
+    batch_size: int,
+    cache_position: torch.Tensor,
+    kv_length: int,
+    kv_offset: int = 0,
+    attention_mask: Optional[torch.Tensor] = None,
+    local_size: Optional[int] = None,
+    allow_is_causal_skip: bool = True,
+    allow_torch_fix: bool = True,
+    **kwargs,
+) -> Optional[torch.Tensor]:
+    q_length = cache_position.shape[0]
+    # Potentially pad the 2D mask, and slice it correctly
+    padding_mask = prepare_padding_mask(attention_mask, kv_length, kv_offset)
+
+    #  Under specific conditions, we can avoid materializing the mask, instead relying on the `is_causal` argument
+    if allow_is_causal_skip and _ignore_causal_mask_sdpa(padding_mask, q_length, kv_length, local_size):
+        return None
+
+    # Similar to `kv_arange = torch.arange(start=kv_offset, end=kv_offset + kv_length, device=cache_position.device)`
+    # but without data-dependent slicing (i.e. torch.compile friendly)
+    kv_arange = torch.arange(kv_length, device=cache_position.device)
+    kv_arange += kv_offset
+    reshaped_cache_position = cache_position.view(-1, 1)
+
+    # This is a bit hacky to know what pattern we are using, but all mask creation function actually forward
+    # the config through kwargs anyway, so it allows to rely on it
+    # Usually, the `mask_function` is the only entry-point to define the pattern - we could do for loops over it,
+    # but this is more efficient
+    sliding_window = getattr(kwargs["config"], "sliding_window", None)
+    chunk_size = getattr(kwargs["config"], "attention_chunk_size", None)
+
+    if sliding_window is not None and chunk_size is not None:
+        raise ValueError("Cannot use both `sliding_window` and `attention_chunk_size`")
+
+    # Simplest and most efficient way to obtain a causal mask
+    causal_mask = kv_arange <= reshaped_cache_position
+    # If using sliding window, add the sliding mask
+    if sliding_window is not None:
+        sliding_mask_overlay = kv_arange > reshaped_cache_position - sliding_window
+        causal_mask *= sliding_mask_overlay
+    # If using chunk attention, add the chunked mask
+    elif chunk_size is not None:
+        chunked_mask_overlay = kv_arange // chunk_size == reshaped_cache_position // chunk_size
+        causal_mask *= chunked_mask_overlay
+
+    causal_mask = causal_mask[None, None, :, :].expand(batch_size, -1, -1, -1)
+    if padding_mask is not None:
+        causal_mask = causal_mask * padding_mask[:, None, None, :]
+
+    # Due to a bug in some older torch version, we need to update the mask in case a query is not attending to any
+    # tokens (due to padding). See details in https://github.com/pytorch/pytorch/issues/110213
+    if is_torch_version("<", "2.5") and allow_torch_fix:
+        causal_mask |= torch.all(~causal_mask, dim=-1, keepdim=True)
+    return causal_mask
+
+
+def eager_mask_without_vmap(*args, **kwargs) -> Optional[torch.Tensor]:
+    kwargs.pop("allow_torch_fix", None)
+    kwargs.pop("allow_is_causal_skip", None)
+    dtype = kwargs.get("dtype", torch.float32)
+    mask = sdpa_mask_without_vmap(*args, **kwargs, allow_is_causal_skip=False, allow_torch_fix=False)  # type: ignore
+    mask = torch.where(mask, torch.tensor(0.0, device=mask.device, dtype=dtype), torch.finfo(dtype).min)  # type: ignore
+    return mask
+
+
 UNSUPPORTED_OPS_PATCHING_SPEC = [
     PatchingSpec(torch.Tensor, "unfold", onnx_compatible_unfold, torch.Tensor.unfold),
     PatchingSpec(torch.linalg, "norm", onnx_compatible_linalg_norm, original_linal_norm),
@@ -355,9 +423,19 @@ class ModelPatcher:
         self.patch_ops()
         setattr(self._model, self.orig_forward_name, self.patched_forward)
 
+        if is_transformers_version(">=", "4.53"):
+            self.original_sdpa_mask = ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
+            self.original_eager_mask = ALL_MASK_ATTENTION_FUNCTIONS["eager"]
+            ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", sdpa_mask_without_vmap)
+            ALL_MASK_ATTENTION_FUNCTIONS.register("eager", eager_mask_without_vmap)
+
     def __exit__(self, exc_type, exc_value, traceback):
         self.restore_ops()
         setattr(self._model, self.orig_forward_name, self.orig_forward)
+
+        if is_transformers_version(">=", "4.53"):
+            ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", self.original_sdpa_mask)
+            ALL_MASK_ATTENTION_FUNCTIONS.register("eager", self.original_eager_mask)
 
     def __call__(self, *args, **kwargs):
         if getattr(self._model, self.orig_forward_name) is self.orig_forward:
@@ -368,14 +446,14 @@ class ModelPatcher:
 class Seq2SeqModelPatcher(ModelPatcher):
     def __enter__(self):
         super().__enter__()
-        if is_transformers_version(">=", "4.48"):
+        if is_transformers_version(">=", "4.48") and is_transformers_version("<", "4.53"):
             # this is required when gpt2 is used as decoder in any
             # encoder-decoder model with cross attention blocks
             ALL_ATTENTION_FUNCTIONS["sdpa"] = patched_sdpa_attention_forward
 
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
-        if is_transformers_version(">=", "4.48"):
+        if is_transformers_version(">=", "4.48") and is_transformers_version("<", "4.53"):
             ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_attention_forward
 
     def __init__(

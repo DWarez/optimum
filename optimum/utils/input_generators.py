@@ -1345,87 +1345,95 @@ class DummyGemma3InputGenerator(DummyTextInputGenerator):
         )
         self.sliding_window_size = getattr(normalized_config, "sliding_window", sequence_length)
 
-    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        if input_name in ["input_ids", "token_type_ids", "position_ids"]:
-            return super().generate(
-                input_name=input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype
-            )
-        if input_name == "attention_mask":
-            return {
-                "full_causal_mask": self._generate_full_causal_mask(framework, float_dtype),
-                "sliding_causal_mask": self._generate_sliding_causal_mask(framework, float_dtype),
-            }
-        # if input_name == "full_causal_mask":
-        #     return self._generate_full_causal_mask(framework, float_dtype)
-        # elif input_name == "sliding_causal_mask":
-        #     return self._generate_sliding_causal_mask(framework, float_dtype)
-        else:
-            raise ValueError(f"What happened? This is not supported and should not be here: {input_name}")
+    # def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+    #     if input_name in ["input_ids", "token_type_ids", "position_ids"]:
+    #         return super().generate(
+    #             input_name=input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype
+    #         )
+    #     if input_name == "attention_mask":
+    #         return {
+    #             "full_attention": self._generate_full_causal_mask(framework, float_dtype),
+    #             "sliding_attention": self._generate_sliding_causal_mask(framework, float_dtype),
+    #         }
+    #     # if input_name == "full_causal_mask":
+    #     #     return self._generate_full_causal_mask(framework, float_dtype)
+    #     # elif input_name == "sliding_causal_mask":
+    #     #     return self._generate_sliding_causal_mask(framework, float_dtype)
+    #     else:
+    #         raise ValueError(f"What happened? This is not supported and should not be here: {input_name}")
 
-    def _generate_full_causal_mask(self, framework: str = "pt", float_dtype: str = "float32"):
-        if framework == "pt":
-            mask = torch.triu(
-                torch.ones((self.sequence_length, self.sequence_length), dtype=DTYPE_MAPPER.pt(float_dtype)),
-                diagonal=1,
-            )
-            mask = mask.masked_fill(mask == 1, float("-inf"))
-            mask = mask.unsqueeze(0).expand(self.batch_size, -1, -1)
-            return mask
-        elif framework == "tf":
-            mask = tf.linalg.band_part(
-                tf.ones((self.sequence_length, self.sequence_length), dtype=DTYPE_MAPPER.tf(float_dtype)), -1, 0
-            )
-            mask = tf.where(mask == 0, float("-inf"), 0.0)
-            mask = tf.expand_dims(mask, 0)
-            mask = tf.tile(mask, [self.batch_size, 1, 1])
-            return mask
-        else:
-            mask = np.triu(
-                np.ones((self.sequence_length, self.sequence_length), dtype=DTYPE_MAPPER.np(float_dtype)), k=1
-            )
-            mask = np.where(mask == 1, float("-inf"), 0.0)
-            mask = np.expand_dims(mask, 0)
-            mask = np.tile(mask, (self.batch_size, 1, 1))
-            return mask
+    # def _generate_full_causal_mask(self, framework: str = "pt", float_dtype: str = "float32"):
+    #     if framework == "pt":
+    #         row_indices = torch.arange(self.sequence_length).view(-1, 1)
+    #         col_indices = torch.arange(self.sequence_length).view(1, -1)
+    #         causal_mask = row_indices >= col_indices
+    #         dtype = getattr(torch, float_dtype)
+    #         mask = torch.zeros((self.sequence_length, self.sequence_length), dtype=dtype)
+    #         mask[~causal_mask] = float("-inf")
+    #         mask = mask.unsqueeze(0).expand(self.batch_size, -1, -1)
+    #         return mask
+    #     elif framework == "tf":
+    #         row_indices, col_indices = tf.meshgrid(
+    #             tf.range(self.sequence_length), tf.range(self.sequence_length), indexing="ij"
+    #         )
+    #         causal_mask = row_indices >= col_indices
+    #         dtype = getattr(tf, float_dtype)
+    #         mask = tf.where(
+    #             causal_mask,
+    #             tf.zeros((self.sequence_length, self.sequence_length), dtype=dtype),
+    #             tf.fill((self.sequence_length, self.sequence_length), float("-inf")),
+    #         )
+    #         mask = tf.expand_dims(mask, 0)
+    #         mask = tf.tile(mask, [self.batch_size, 1, 1])
+    #         return mask
 
-    def _generate_sliding_causal_mask(self, framework: str = "pt", float_dtype: str = "fp32"):
-        if framework == "pt":
-            mask = torch.full(
-                (self.sequence_length, self.sequence_length), float("-inf"), dtype=DTYPE_MAPPER.pt(float_dtype)
-            )
-            for i in range(self.sequence_length):
-                start = max(0, i - self.sliding_window_size + 1)
-                mask[i, start : i + 1] = 0.0
-            mask = mask.unsqueeze(0).expand(self.batch_size, -1, -1)
-            return mask
-        elif framework == "tf":
-            mask = tf.fill((self.sequence_length, self.sequence_length), float("-inf"))
-            mask = tf.cast(mask, DTYPE_MAPPER.tf(float_dtype))
+    #     else:
+    #         row_indices = np.arange(self.sequence_length).reshape(-1, 1)
+    #         col_indices = np.arange(self.sequence_length).reshape(1, -1)
+    #         causal_mask = row_indices >= col_indices
+    #         dtype = getattr(np, float_dtype)
+    #         mask = np.full((self.sequence_length, self.sequence_length), float("-inf"), dtype=dtype)
+    #         mask[causal_mask] = 0.0
+    #         mask = np.expand_dims(mask, 0)
+    #         mask = np.repeat(mask, self.batch_size, axis=0)
+    #         return mask
 
-            updates = []
-            indices = []
-            for i in range(self.sequence_length):
-                start = max(0, i - self.sliding_window_size + 1)
-                for j in range(start, i + 1):
-                    indices.append([i, j])
-                    updates.append(0.0)
-            if indices:
-                indices = tf.constant(indices)
-                updates = tf.constant(updates, dtype=DTYPE_MAPPER.tf(float_dtype))
-                mask = tf.tensor_scatter_nd_update(mask, indices, updates)
-            mask = tf.expand_dims(mask, 0)
-            mask = tf.tile(mask, [self.batch_size, 1, 1])
-            return mask
-        else:
-            mask = np.full(
-                (self.sequence_length, self.sequence_length), float("-inf"), dtype=DTYPE_MAPPER.np(float_dtype)
-            )
-            for i in range(self.sequence_length):
-                start = max(0, i - self.sliding_window_size + 1)
-                mask[i, start : i + 1] = 0.0
-            mask = np.expand_dims(mask, 0)
-            mask = np.tile(mask, (self.batch_size, 1, 1))
-            return mask
+    # def _generate_sliding_causal_mask(self, window_size: int, framework: str = "pt", float_dtype: str = "float32"):
+    #     if framework == "pt":
+    #         row_indices = torch.arange(self.sequence_length).view(-1, 1)
+    #         col_indices = torch.arange(self.sequence_length).view(1, -1)
+    #         causal_mask = (row_indices >= col_indices) & (row_indices - col_indices < window_size)
+    #         dtype = getattr(torch, float_dtype)
+    #         mask = torch.zeros((self.sequence_length, self.sequence_length), dtype=dtype)
+    #         mask[~causal_mask] = float("-inf")
+    #         mask = mask.unsqueeze(0).expand(self.batch_size, -1, -1)
+    #         return mask
+    #     elif framework == "tf":
+    #         row_indices, col_indices = tf.meshgrid(
+    #             tf.range(self.sequence_length), tf.range(self.sequence_length), indexing="ij"
+    #         )
+    #         causal_condition = row_indices >= col_indices
+    #         window_condition = (row_indices - col_indices) < window_size
+    #         sliding_mask = causal_condition & window_condition
+    #         dtype = getattr(tf, float_dtype)
+    #         mask = tf.where(
+    #             sliding_mask,
+    #             tf.zeros((self.sequence_length, self.sequence_length), dtype=dtype),
+    #             tf.fill((self.sequence_length, self.sequence_length), float("-inf")),
+    #         )
+    #         mask = tf.expand_dims(mask, 0)
+    #         mask = tf.tile(mask, [self.batch_size, 1, 1])
+    #         return mask
+    #     else:
+    #         row_indices = np.arange(self.sequence_length).reshape(-1, 1)
+    #         col_indices = np.arange(self.sequence_length).reshape(1, -1)
+    #         causal_mask = (row_indices >= col_indices) & (row_indices - col_indices < window_size)
+    #         dtype = getattr(np, float_dtype)
+    #         mask = np.full((self.sequence_length, self.sequence_length), float("-inf"), dtype=dtype)
+    #         mask[causal_mask] = 0.0
+    #         mask = np.expand_dims(mask, 0)
+    #         mask = np.repeat(mask, self.batch_size, axis=0)
+    #         return mask
 
 
 class DummySpeechT5InputGenerator(DummyInputGenerator):
